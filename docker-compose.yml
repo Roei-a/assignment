@@ -1,0 +1,44 @@
+services:
+  epoch-service:
+    build: services/epoch-service
+    image: epoch-service:local
+    # --- Image architecture ---------------------------------------------------
+    # By default the image is built for the HOST architecture (nothing set here).
+    # To pin a specific architecture, either:
+    #   - uncomment the line below, or
+    #   - run with an override, e.g. `make up ARCH=amd` / `make up ARCH=arm`
+    #     (which exports DOCKER_DEFAULT_PLATFORM for you).
+    # Options: linux/amd64 (Intel/AMD)  |  linux/arm64 (Apple Silicon / ARM).
+    # platform: linux/amd64
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  now-time-service:
+    build: services/now-time-service
+    image: now-time-service:local
+    # --- Image architecture ---------------------------------------------------
+    # By default the image is built for the HOST architecture (nothing set here).
+    # To pin a specific architecture, either:
+    #   - uncomment the line below, or
+    #   - run with an override, e.g. `make up ARCH=amd` / `make up ARCH=arm`
+    #     (which exports DOCKER_DEFAULT_PLATFORM for you).
+    # Options: linux/amd64 (Intel/AMD)  |  linux/arm64 (Apple Silicon / ARM).
+    # platform: linux/arm64
+    environment:
+      # Overrides the config-file default so B reaches A via the Compose DNS name.
+      EPOCH_SERVICE_URL: http://epoch-service:8080
+    ports:
+      - "8081:8081"
+    depends_on:
+      epoch-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
