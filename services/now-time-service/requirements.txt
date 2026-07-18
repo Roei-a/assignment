@@ -1,0 +1,7 @@
+fastapi==0.115.6
+uvicorn==0.32.1
+httpx==0.28.1
+PyYAML==6.0.2
+# Provides the IANA timezone database for zoneinfo inside the slim image,
+# where the system tz database is not installed.
+tzdata==2024.2
