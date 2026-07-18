@@ -20,14 +20,10 @@ env:
   REGISTRY: registry.example.com/platform
 
 jobs:
+
   # Decide which architecture(s) to build and test, as a JSON array
   # (["amd64","arm64"]) that drives both the integration-test and publish
-  # `strategy.matrix`. A matrix requires real JSON (fromJSON) and is resolved
-  # before any step runs, so it must be pre-built here; each short name also
-  # selects the native runner for that leg (amd64 -> ubuntu-latest,
-  # arm64 -> ubuntu-24.04-arm).
-  # Policy: pull requests -> amd only (fast feedback); push to main -> both;
-  # manual runs -> whatever the `arch` input selects (defaults to both).
+  # `strategy.matrix`.
   arch:
     runs-on: ubuntu-latest
     outputs:
@@ -177,4 +173,3 @@ jobs:
         run: |
           IMAGE="$REGISTRY/${{ matrix.service }}:${{ steps.tag.outputs.tag }}"
           echo "[simulated] docker push $IMAGE"
-          echo "Skipped real push per assignment instructions."

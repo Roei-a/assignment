@@ -11,6 +11,32 @@ Two small REST services, a local integration environment, and a CI pipeline.
 service-to-service communication: B fetches the current time, sends it to A's
 `/epoch`, and returns the result.
 
+## Prerequisites
+
+- Docker (with the Compose plugin)
+- Python 3.9+
+- `make`
+
+## Quick start
+
+```bash
+make up                 # build and start both services, wait until healthy
+
+# Service A — convert a date to epoch
+curl -s -X POST localhost:8080/epoch \
+  -H 'Content-Type: application/json' \
+  -d '{"date": "2026-06-15T10:00:00Z"}'
+# => {"epoch": 1781517600}
+
+# Service B — current time, and current time converted via Service A
+curl -s localhost:8081/now         # => {"now": "2026-07-18T08:07:23Z"}
+curl -s localhost:8081/now-epoch   # B calls A: {"now": "...", "epoch": ...}
+make down
+```
+Run `make` (or `make help`) to see every available target.
+
+[see full running instructions here](#running-the-services)
+
 ## Repository structure
 
 ```
@@ -30,30 +56,6 @@ service-to-service communication: B fetches the current time, sends it to A's
 └── .github/workflows/ci.yml  # CI pipeline
 ```
 
-## Prerequisites
-
-- Docker (with the Compose plugin) — for the integration environment
-- Python 3.9+ — for running tests / services directly on the host
-- `make`
-
-## Quick start
-
-```bash
-make up                 # build and start both services, wait until healthy
-
-# Service A — convert a date to epoch
-curl -s -X POST localhost:8080/epoch \
-  -H 'Content-Type: application/json' \
-  -d '{"date": "2026-06-15T10:00:00Z"}'
-# => {"epoch": 1781517600}
-
-# Service B — current time, and current time converted via Service A
-curl -s localhost:8081/now         # => {"now": "2026-07-18T08:07:23Z"}
-curl -s localhost:8081/now-epoch   # B calls A: {"now": "...", "epoch": ...}
-make down
-```
-
-Run `make` (or `make help`) to see every available target.
 
 ## API
 
@@ -200,12 +202,12 @@ make integration-test   # starts the Compose env, tests cross-service comms, tea
 5. `integration-test` — brings up the Compose environment (building the affected
    services) and runs the cross-service tests. Matrixed over architecture.
 
-**On every push to `main`:** all of the above (now across **both** architectures),
+**On every push to `main`:** all of the above,
 plus `publish` — matrixed over **service × architecture**, it builds a
 per-architecture image for each affected service on a native runner, tags it
 `<arch>-<commit-sha>` (e.g. `epoch-service:arm64-828d488...`), and **simulates**
 pushing it to a registry (prints the `docker push` command; no real registry is
-involved, per the assignment).
+involved).
 
 **Architecture matrix.** The `arch` job decides the target architecture(s) and
 emits them as a JSON array (`["amd64","arm64"]`): pull requests use **amd64 only**
@@ -228,6 +230,88 @@ make ci   # fmt-check + lint + unit tests — identical to the PR jobs
 The pipeline can also be run with [act](https://github.com/nektos/act) if you
 prefer executing the actual workflow file locally.
 
+## Adding a new service to this monorepo
+
+Every service follows the same shape, so adding one is mostly mechanical. Using
+a hypothetical **`greeting-service`** as the example:
+
+1. **Scaffold the service directory**, mirroring an existing service:
+   ```
+   services/greeting-service/
+   ├── app/
+   │   ├── __init__.py
+   │   ├── config.py     # Settings dataclass + load_settings() (copy & adapt)
+   │   └── main.py        # FastAPI app, endpoints, error_response()
+   ├── config/
+   │   └── config.yaml    # host/port/endpoints (+ dependencies/time if needed)
+   ├── tests/
+   │   ├── __init__.py
+   │   └── test_api.py    # unit tests, construct Settings directly (no file I/O)
+   ├── Dockerfile          # copy an existing one, adjust WORKDIR/EXPOSE
+   └── requirements.txt    # this service's runtime deps only
+   ```
+   Reuse the existing pattern: a typed `Settings` dataclass, `load_settings()`
+   reading YAML + failing fast on missing keys, and `error_response()` returning
+   `{"code": ..., "error": ...}` (see [Error format](#error-format-both-services)
+   above) — including handlers for framework 404/405/500 so every error, not
+   just the ones you write, carries a `code`.
+
+2. **Wire it into Compose** (`docker-compose.yml`): add a service block with
+   `build`, `image`, `ports`, and a `healthcheck` hitting its `/healthz`. Add
+   `depends_on: { condition: service_healthy }` if another service must be up
+   first (see `now-time-service`'s dependency on `epoch-service`).
+   ```yaml
+   greeting-service:
+     build: services/greeting-service
+     image: greeting-service:local
+     ports: ["8082:8082"]
+     healthcheck:
+       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/healthz')"]
+       interval: 5s
+       timeout: 3s
+       retries: 5
+   ```
+
+3. **Add it to the Makefile**: append the name to `SERVICES` (drives
+   `make unit-test`/`make test`), and optionally a `run-greeting` target
+   mirroring `run-epoch` / `run-now-time`.
+   ```make
+   SERVICES := epoch-service now-time-service greeting-service
+   ```
+
+4. **Add it to CI's affected-services detection** (`.github/workflows/ci.yml`,
+   `changes` job): a new `paths-filter` entry and the matching `jq` line.
+   ```yaml
+   greeting-service:
+     - *shared
+     - 'services/greeting-service/**'
+   ```
+   ```bash
+   if [ "${{ steps.filter.outputs.greeting-service }}" = "true" ]; then
+     services=$(echo "$services" | jq -c '. + ["greeting-service"]')
+   fi
+   ```
+   Everything downstream (`test`, `integration-test`'s build, `publish`) is
+   already matrixed over the affected-services list, so no further CI changes
+   are needed.
+
+5. **Add tests**:
+   - Unit tests in `services/greeting-service/tests/` (construct `Settings`
+     explicitly, as the existing services do — no dependency on a config file
+     on disk).
+   - If it talks to another service, add a case to `tests/integration/` that
+     hits it through the real Compose network (see
+     `test_service_to_service_communication` for the existing B→A pattern).
+
+6. **Update the docs**: add a row to the repository-structure tree, an API
+   table under [API](#api) with its endpoints and error cases, and a line under
+   [Running the services](#running-the-services) if it needs host-mode
+   instructions.
+
+That's the full surface: **one service directory, one Compose block, one
+Makefile entry, one CI filter block, tests, and a docs update** — no other file
+in the repo needs to change.
+
 ## Assumptions & design decisions
 
 - **now-time-service implementation**: the assignment references provided code
@@ -235,8 +319,6 @@ prefer executing the actual workflow file locally.
   and implemented a minimal equivalent in the meantime (returns current UTC
   time as ISO-8601); it can be swapped for the original without changing the
   environment, CI, or tests.
-- **Naive datetimes are treated as UTC** (`"2026-06-15T10:00:00"` ==
-  `"...T10:00:00Z"`). Dates with an explicit offset are converted correctly.
 - **Validation errors return 400** (not FastAPI's default 422) with a
   human-readable `{"error": ...}` message — clearer for API consumers.
 - **Direction of the dependency**: Service A (epoch-service) stays pure and
@@ -245,10 +327,18 @@ prefer executing the actual workflow file locally.
   Compose network, which the integration test asserts on. Every B→A failure
   returns a 502 with an explanation of the likely cause (A down, A rejected the
   request, or A returned an unexpected body).
-- **Python + FastAPI** for both services: small, typed, fast to review, with
-  first-class test support. **Docker Compose** over Kubernetes: right-sized
-  for a two-service local environment — one command, no cluster required.
 - **"Affected services" in CI** is computed from changed paths; shared
   infrastructure files conservatively mark every service as affected.
-- **Image publishing is simulated** by printing the `docker push` commands the
-  pipeline would run, per the assignment note.
+- **Multi-architecture build & test, on native runners**: CI resolves the
+  target architecture(s) once (amd64-only on pull requests for fast feedback;
+  both amd64 and arm64 on push to `main`; a manual `workflow_dispatch` can
+  request `amd` / `arm` / `both`) as a JSON array, which drives both the
+  `integration-test` and `publish` matrices. Each leg runs on a runner **native**
+  to that architecture (`ubuntu-latest` for amd64, `ubuntu-24.04-arm` for
+  arm64) rather than emulating one architecture on the other — slightly more
+  CI minutes, but every image is genuinely built and tested on real hardware.
+- **Per-architecture image tags** (`<arch>-<commit-sha>`, e.g.
+  `epoch-service:arm64-828d488...`) This keeps it unambiguous exactly which architecture
+  and commit an image corresponds to.
+- **Image publishing is simulated** by printing the `docker push` command per
+  architecture the pipeline would run, per the assignment note.
