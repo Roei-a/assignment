@@ -1,0 +1,9 @@
+# Service A configuration. Used both on the host and inside Docker (the service
+# has no environment-specific values). Override the file with CONFIG_PATH.
+server:
+  host: 0.0.0.0
+  port: 8080
+
+endpoints:
+  epoch: /epoch
+  health: /healthz

@@ -1,0 +1,12 @@
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.ruff.lint.pyupgrade]
+# FastAPI evaluates endpoint annotations at runtime, and PEP 604 unions
+# (`X | None`) are not runtime-supported before Python 3.10. Keep the
+# `Optional[...]` form so the services run on Python 3.9.
+keep-runtime-typing = true
