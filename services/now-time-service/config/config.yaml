@@ -1,0 +1,20 @@
+# Service B configuration.
+server:
+  host: 0.0.0.0
+  port: 8081
+
+endpoints:
+  now: /now
+  now_epoch: /now-epoch
+  health: /healthz
+
+time:
+  # Default timezone for /now and /now-epoch (IANA name). Overridable per
+  # request with ?tz=<name>.
+  default_timezone: UTC
+
+dependencies:
+  # Where to reach epoch-service (Service A). Defaults to localhost for running
+  # on the host; inside Docker Compose this is overridden by the
+  # EPOCH_SERVICE_URL environment variable (set to the Compose DNS name).
+  epoch_service_url: http://localhost:8080
