@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Target architecture(s) for image builds"
+        type: choice
+        options:
+          - amd
+          - arm
+          - both
+        default: both
+
+env:
+  # Simulated registry — no real publishing happens (per assignment note).
+  REGISTRY: registry.example.com/platform
+
+jobs:
+  # Decide which architecture(s) to build and test, as a JSON array
+  # (["amd64","arm64"]) that drives both the integration-test and publish
+  # `strategy.matrix`. A matrix requires real JSON (fromJSON) and is resolved
+  # before any step runs, so it must be pre-built here; each short name also
+  # selects the native runner for that leg (amd64 -> ubuntu-latest,
+  # arm64 -> ubuntu-24.04-arm).
+  # Policy: pull requests -> amd only (fast feedback); push to main -> both;
+  # manual runs -> whatever the `arch` input selects (defaults to both).
+  arch:
+    runs-on: ubuntu-latest
+    outputs:
+      arches: ${{ steps.resolve.outputs.arches }}
+    steps:
+      - name: Resolve requested architecture(s)
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            choice="${{ github.event.inputs.arch }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            choice="both"
+          else
+            choice="amd"   # pull_request
+          fi
+          case "$choice" in
+            amd)  arches='["amd64"]' ;;
+            arm)  arches='["arm64"]' ;;
+            both) arches='["amd64","arm64"]' ;;
+            *)    echo "Unknown arch '$choice'"; exit 1 ;;
+          esac
+          echo "arches=$arches" >> "$GITHUB_OUTPUT"
+          echo "Resolved arches: $arches"
+          echo "choice=$choice  arches=$arches  platforms=$platforms"
+
+  # Detect which services are affected by the change, so we only test/build
+  # what actually changed. Shared files (compose, CI, tooling) affect all.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      affected: ${{ steps.affected.outputs.services }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            shared: &shared
+              - 'docker-compose.yml'
+              - 'Makefile'
+              - 'pyproject.toml'
+              - 'requirements-dev.txt'
+              - '.github/workflows/**'
+              - 'tests/integration/**'
+            epoch-service:
+              - *shared
+              - 'services/epoch-service/**'
+            now-time-service:
+              - *shared
+              - 'services/now-time-service/**'
+      - name: Build affected-services matrix
+        id: affected
+        run: |
+          services='[]'
+          if [ "${{ steps.filter.outputs.epoch-service }}" = "true" ]; then
+            services=$(echo "$services" | jq -c '. + ["epoch-service"]')
+          fi
+          if [ "${{ steps.filter.outputs.now-time-service }}" = "true" ]; then
+            services=$(echo "$services" | jq -c '. + ["now-time-service"]')
+          fi
+          echo "services=$services" >> "$GITHUB_OUTPUT"
+          echo "Affected services: $services"
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install ruff==0.8.4
+      - name: Check formatting
+        run: ruff format --check .
+      - name: Lint
+        run: ruff check .
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.affected != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: ${{ fromJSON(needs.changes.outputs.affected) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Unit tests (${{ matrix.service }})
+        working-directory: services/${{ matrix.service }}
+        run: python -m pytest -q
+
+  # Build the whole environment and run the cross-service integration tests,
+  # once per requested architecture. Each architecture runs on a NATIVE runner
+  # (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm), so the images are built
+  # and exercised for real on that architecture — no emulation. This also
+  # satisfies the "build affected services" requirement, since compose builds
+  # them here.
+  integration-test:
+    needs: [changes, arch]
+    if: needs.changes.outputs.affected != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.arch.outputs.arches) }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pytest==8.3.4 httpx==0.28.1
+      - name: Start environment (${{ matrix.arch }}, native)
+        run: docker compose up -d --build --wait
+      - name: Run integration tests (${{ matrix.arch }})
+        run: python -m pytest -q tests/integration
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Tear down
+        if: always()
+        run: docker compose down
+
+  # On every push to main: build a per-architecture image for each affected
+  # service on a native runner, tag it <arch>-<commit-sha>
+  # (e.g. epoch-service:arm64-828d488...), and simulate publishing it.
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.affected != '[]'
+    needs: [changes, arch, format, test, integration-test]
+    strategy:
+      matrix:
+        service: ${{ fromJSON(needs.changes.outputs.affected) }}
+        arch: ${{ fromJSON(needs.arch.outputs.arches) }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate image tag
+        id: tag
+        run: echo "tag=${{ matrix.arch }}-$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Build image (${{ matrix.service }}, ${{ matrix.arch }})
+        # Built natively on a ${{ matrix.arch }} runner, so a plain docker build
+        # produces the correct architecture — no emulation needed.
+        run: docker build services/${{ matrix.service }} -t "$REGISTRY/${{ matrix.service }}:${{ steps.tag.outputs.tag }}"
+      - name: Simulate publishing to registry
+        run: |
+          IMAGE="$REGISTRY/${{ matrix.service }}:${{ steps.tag.outputs.tag }}"
+          echo "[simulated] docker push $IMAGE"
+          echo "Skipped real push per assignment instructions."
